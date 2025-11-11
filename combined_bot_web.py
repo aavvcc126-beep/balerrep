@@ -516,7 +516,7 @@ def run_bot_polling():
     )
     application.add_handler(conv_handler)
     print(f"[Bot] Bot is running. Send /update from chat ID {TELEGRAM_CHAT_ID_INT} to begin.")
-    application.run_polling()
+    application.run_polling(stop_signals=None)
 
 # ==========================================================
 # === 3. SCRIPT STARTUP
