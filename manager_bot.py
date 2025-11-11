@@ -1,12 +1,3 @@
-# === PELLA.APP VERSION (manager_bot.py) ===
-#
-# This script is designed to run in two separate services on Pella.app:
-# 1. 'bot': Runs main_bot()
-# 2. 'scraper': Runs main_scraper()
-#
-# Both services connect to the SAME Postgres database.
-# =================================================
-
 import os
 import sys
 import re
@@ -17,9 +8,7 @@ import concurrent.futures
 import socketio
 import json
 import pycountry
-import datetime
-import psycopg2 # <-- For Postgres
-import urllib.parse as urlparse # <-- For Postgres
+import threading  # <-- 1. IMPORTED FOR PARALLEL EXECUTION
 from bs4 import BeautifulSoup
 from http.cookiejar import CookieJar
 from requests.cookies import RequestsCookieJar
@@ -29,112 +18,58 @@ from urllib.parse import urlencode
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, ContextTypes, filters
 
-# === CONFIG (Combined) ===
-# --- Load from Environment Variables (Pella.app will provide these) ---
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-DATABASE_URL = os.environ.get('DATABASE_URL')
-TELEGRAM_CHAT_ID = -1003175183012      # Hardcoded as it's an ID
-TELEGRAM_CHAT_ID_STR = "-1003175183012" # Hardcoded as it's an ID
+# ==========================================================
+# === UNIFIED CONFIGURATION
+# ==========================================================
+TELEGRAM_BOT_TOKEN = "7178045311:AAGCfm5V4lItW2Ir_n9F51_ammj5G7Hcs2g"
+TELEGRAM_CHAT_ID_INT = -1003175183012     # For the bot's filter (as an integer)
+TELEGRAM_CHAT_ID_STR = "-1003175183012"    # For sending messages (as a string)
 
-# --- Static Config ---
 LIVE_URL = "https://www.orangecarrier.com/live/calls"
 SOCKET_URL = "wss://orangecarrier.com:8443"
 BASE_URL = "https://www.orangecarrier.com"
-# CREDS_FILE = 'creds.json' # <-- We no longer use this file
+CREDS_FILE = 'creds.json'
 
-# --- Auto-install libraries (This is now less important, as requirements.txt handles it) ---
+# --- Conversation States for Bot ---
+GET_TOKEN, GET_USER, GET_COOKIE = range(3)
+
+# --- Global variable to hold the scraper's socket client ---
+# This allows the bot to disconnect the scraper
+global_sio_client = None
+
+# ==========================================================
+# === AUTO-INSTALL LIBRARIES
+# ==========================================================
 def install():
-    """Installs required libraries for the scraper."""
-    libs = ["requests", "socketio", "bs4", "pycountry", "psycopg2-binary"]
+    """Installs required libraries."""
+    libs = ["requests", "socketio", "bs4", "pycountry", "python-telegram-bot"]
     for m in libs:
         try:
             if m == "bs4":
                 __import__("bs4")
             elif m == "pycountry":
                 __import__("pycountry")
-            elif m == "psycopg2-binary":
-                __import__("psycopg2")
+            elif m == "python-telegram-bot":
+                __import__("telegram")
             else:
                 __import__(m)
         except ImportError:
             print(f"Installing {m}...")
-            # ... (rest of install logic) ...
-            pass # Pella should handle this via requirements.txt
+            if m == "socketio":
+                os.system(f"{sys.executable} -m pip install \"python-socketio[client]\"")
+            elif m == "bs4":
+                os.system(f"{sys.executable} -m pip install beautifulsoup4")
+            elif m == "pycountry":
+                os.system(f"{sys.executable} -m pip install pycountry")
+            elif m == "python-telegram-bot":
+                 os.system(f"{sys.executable} -m pip install python-telegram-bot")
+            else:
+                os.system(f"{sys.executable} -m pip install {m}")
 
 # ==========================================================
-# === DATABASE FUNCTIONS (NEW)
+# === SCRAPER FUNCTIONS (from fixedd.py)
 # ==========================================================
 
-def get_db_conn():
-    """Establishes a connection to the Postgres database."""
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL environment variable is not set.")
-    url = urlparse.urlparse(DATABASE_URL)
-    conn = psycopg2.connect(
-        dbname=url.path[1:],
-        user=url.username,
-        password=url.password,
-        host=url.hostname,
-        port=url.port
-    )
-    return conn
-
-def setup_database():
-    """Run by the bot to create the credentials table if it doesn't exist."""
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS credentials (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
-        print("Database table checked/created successfully.")
-    except Exception as e:
-        print(f"DB Setup Error: {e}. Make sure DATABASE_URL is set.")
-
-# ==========================================================
-# === SCRAPER FUNCTIONS (Modified for DB)
-# ==========================================================
-
-# === MODIFIED: Load Credentials from DB ===
-def load_credentials():
-    """Loads credentials from the database."""
-    print("Loading credentials from database...")
-    if not DATABASE_URL:
-        print("Error: DATABASE_URL environment variable not set.")
-        return None, None, None
-        
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT key, value FROM credentials")
-        creds = dict(cur.fetchall())
-        cur.close()
-        conn.close()
-
-        token = creds.get('MANUAL_TOKEN')
-        user = creds.get('MANUAL_USER')
-        cookie = creds.get('MANUAL_COOKIE_STRING')
-
-        if not token or not user or not cookie:
-            print("Error: Database is incomplete. Please run /update on the bot.")
-            return None, None, None
-            
-        print("Credentials loaded successfully from DB.")
-        return token, user, cookie
-        
-    except Exception as e:
-        print(f"Error reading from DB: {e}")
-        return None, None, None
-
-# --- (Rest of scraper functions are unchanged) ---
-
-# === HELPER: Get Flag Emoji ===
 def get_flag_emoji(country_name):
     """Generates a flag emoji from a country name."""
     try:
@@ -144,7 +79,33 @@ def get_flag_emoji(country_name):
     except:
         return "🌍"
 
-# === HELPER: Extract Country ===
+def load_credentials():
+    """Loads credentials from the creds.json file."""
+    print("[Scraper] Loading credentials from creds.json...")
+    if not os.path.exists(CREDS_FILE):
+        print(f"[Scraper] Error: `{CREDS_FILE}` not found.")
+        print("[Scraper] Please send the /update command to the bot to create it.")
+        return None, None, None
+        
+    try:
+        with open(CREDS_FILE, 'r') as f:
+            creds = json.load(f)
+        
+        token = creds.get('MANUAL_TOKEN')
+        user = creds.get('MANUAL_USER')
+        cookie = creds.get('MANUAL_COOKIE_STRING')
+        
+        if not token or not user or not cookie:
+            print("[Scraper] Error: `creds.json` is incomplete. Please run /update on the bot again.")
+            return None, None, None
+            
+        print("[Scraper] Credentials loaded successfully.")
+        return token, user, cookie
+        
+    except Exception as e:
+        print(f"[Scraper] Error reading `{CREDS_FILE}`: {e}")
+        return None, None, None
+
 def get_country_name(termination_string):
     """Extracts the country name from a termination string."""
     try:
@@ -160,7 +121,6 @@ def get_country_name(termination_string):
     except:
         return "UNKNOWN"
 
-# === HELPER: Mask Number ===
 def mask_number(num):
     """Masks a number like '8551****649'."""
     try:
@@ -171,12 +131,11 @@ def mask_number(num):
     except:
         return num
 
-# === HELPER: Send Text Message ===
 def send_telegram_message(text_message):
     """Sends a plain text message to Telegram."""
     try:
         payload = {
-            'chat_id': TELEGRAM_CHAT_ID_STR,
+            'chat_id': TELEGRAM_CHAT_ID_STR, # Use string version
             'text': text_message,
             'parse_mode': 'HTML'
         }
@@ -186,11 +145,10 @@ def send_telegram_message(text_message):
             timeout=10
         )
         if not r.ok:
-            print(f"TG Message Failed: {r.text}")
+            print(f"[Scraper] TG Message Failed: {r.text}")
     except Exception as e:
-        print(f"TG Message Error: {e}")
+        print(f"[Scraper] TG Message Error: {e}")
 
-# === TELEGRAM AUDIO (with Thumbnail) ===
 def send_telegram_audio(file, num, country, duration_str):
     """Sends the audio file with the new caption format and thumbnail."""
     audio_f = None
@@ -214,7 +172,7 @@ def send_telegram_audio(file, num, country, duration_str):
             duration_int = 0
         
         data = {
-            "chat_id": TELEGRAM_CHAT_ID_STR, 
+            "chat_id": TELEGRAM_CHAT_ID_STR, # Use string version
             "caption": caption,
             "title": file_title,
             "duration": duration_int
@@ -227,11 +185,11 @@ def send_telegram_audio(file, num, country, duration_str):
         try:
             thumb_f = open("thumbnail.png", "rb") 
             files_payload["thumbnail"] = thumb_f
-            print("Attaching thumbnail.png...")
+            print("[Scraper] Attaching thumbnail.png...")
         except FileNotFoundError:
-            print("thumbnail.png not found, sending audio without it.")
+            print("[Scraper] thumbnail.png not found, sending audio without it.")
         except Exception as e:
-            print(f"Error attaching thumbnail: {e}")
+            print(f"[Scraper] Error attaching thumbnail: {e}")
 
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio",
@@ -239,10 +197,10 @@ def send_telegram_audio(file, num, country, duration_str):
             files=files_payload,
             timeout=30
         )
-        print("Telegram: Audio Sent" if r.ok else f"TG Audio Failed: {r.text}")
+        print("[Scraper] Telegram: Audio Sent" if r.ok else f"TG Audio Failed: {r.text}")
 
     except Exception as e:
-        print("TG Audio Error:", e)
+        print("[Scraper] TG Audio Error:", e)
     finally:
         if audio_f:
             audio_f.close()
@@ -253,7 +211,6 @@ def send_telegram_audio(file, num, country, duration_str):
         except: 
             pass
 
-# === DOWNLOAD ===
 def download(url, cli, dur, country, cookie_jar):
     try:
         s = requests.Session()
@@ -271,7 +228,7 @@ def download(url, cli, dur, country, cookie_jar):
         }
         s.headers.update(headers)
 
-        print(f"Downloading audio for {cli} from {url}")
+        print(f"[Scraper] Downloading audio for {cli} from {url}")
         
         with s.get(url, stream=True, timeout=30) as r:
             r.raise_for_status()
@@ -282,7 +239,7 @@ def download(url, cli, dur, country, cookie_jar):
             elif 'aac' in content_type: extension = ".aac"
 
             fn = f"rec_{cli}_{int(time.time())}{extension}"
-            print(f"Saving as: {fn} (Content-Type: {content_type})")
+            print(f"[Scraper] Saving as: {fn} (Content-Type: {content_type})")
             
             with open(fn, "wb") as f:
                 for c in r.iter_content(8192): 
@@ -291,9 +248,8 @@ def download(url, cli, dur, country, cookie_jar):
         send_telegram_audio(fn, cli, country, dur)
         
     except Exception as e:
-        print(f"Download failed: {e}")
+        print(f"[Scraper] Download failed: {e}")
 
-# === HELPER: Parse Cookie String ===
 def parse_cookie_string_to_jar(cookie_string):
     cookie_jar = RequestsCookieJar()
     if not cookie_string:
@@ -310,7 +266,6 @@ def parse_cookie_string_to_jar(cookie_string):
             )
     return cookie_jar
 
-# === HANDLE LIVE CALL DATA ===
 class CallHandler:
     def __init__(self, http_session, executor):
         self.http_session = http_session
@@ -358,8 +313,8 @@ class CallHandler:
                         
                         masked_num = mask_number(did)
                         flag = get_flag_emoji(country)
-                        print(f"--- New Call Detected (at {duration}s) ---")
-                        print(f"  CLI/DID: {did} | UUID: {uuid}")
+                        print(f"[Scraper] --- New Call Detected (at {duration}s) ---")
+                        print(f"[Scraper]   CLI/DID: {did} | UUID: {uuid}")
                         text_message = f"🔥 NEW CALL {country} {flag} DETECTED ✨\n📞 Number: {masked_num}\n⏳ Waiting for Call 📞"
                         self.executor.submit(send_telegram_message, text_message)
                     
@@ -376,8 +331,8 @@ class CallHandler:
                         country = call_info['country']
                         last_duration = str(call_data.get('duration', call_info['duration']))
 
-                        print(f"--- Call Ended. Submitting Download ---")
-                        print(f"  CLI/DID: {did} | UUID: {uuid} | Duration: {last_duration}")
+                        print(f"[Scraper] --- Call Ended. Submitting Download ---")
+                        print(f"[Scraper]   CLI/DID: {did} | UUID: {uuid} | Duration: {last_duration}")
                         
                         download_url = f"{BASE_URL}/live/calls/sound?did={did}&uuid={uuid}"
                         
@@ -395,24 +350,18 @@ class CallHandler:
 
             active_uuids_to_prune = set(self.active_calls.keys()) - all_current_uuids_on_page
             for uuid in active_uuids_to_prune:
-                print(f"Pruning stale call (no 'end' event): {uuid}")
+                print(f"[Scraper] Pruning stale call (no 'end' event): {uuid}")
                 self.active_calls.pop(uuid)
                 if uuid in self.detected_uuids:
                     self.detected_uuids.remove(uuid)
 
         except Exception as e:
-            print(f"Error in on_call_event: {e}")
-            print(f"Data: {str(data)[:200]}...")
-
+            print(f"[Scraper] Error in on_call_event: {e}")
+            print(f"[Scraper] Data: {str(data)[:200]}...")
 
 # ==========================================================
-# === BOT FUNCTIONS (Modified for DB)
+# === BOT FUNCTIONS (from update.py)
 # ==========================================================
-
-# --- Conversation States ---
-GET_TOKEN, GET_USER, GET_COOKIE = range(3)
-
-# --- Conversation Handlers ---
 
 async def start_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the credential update conversation."""
@@ -441,47 +390,40 @@ async def get_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return GET_COOKIE
 
 async def get_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Saves all credentials to the DATABASE and ends conversation."""
+    """Saves all credentials to file and tells scraper to restart."""
+    global global_sio_client # <-- 2. ACCESS THE GLOBAL SCRAPER CLIENT
+    
     context.user_data['cookie'] = update.message.text.strip()
     
-    if not DATABASE_URL:
-        await update.message.reply_text("❌ **Error!**\n`DATABASE_URL` is not set. Bot cannot save credentials.")
-        return ConversationHandler.END
-
+    creds = {
+        'MANUAL_TOKEN': context.user_data['token'],
+        'MANUAL_USER': context.user_data['user'],
+        'MANUAL_COOKIE_STRING': context.user_data['cookie']
+    }
+    
     try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        
-        # Use UPSERT to insert or update the keys
-        cur.execute("""
-            INSERT INTO credentials (key, value) VALUES (%s, %s)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-        """, ('MANUAL_TOKEN', context.user_data['token']))
-        
-        cur.execute("""
-            INSERT INTO credentials (key, value) VALUES (%s, %s)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-        """, ('MANUAL_USER', context.user_data['user']))
-        
-        cur.execute("""
-            INSERT INTO credentials (key, value) VALUES (%s, %s)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-        """, ('MANUAL_COOKIE_STRING', context.user_data['cookie']))
-        
-        conn.commit() # Save the changes
-        cur.close()
-        conn.close()
+        with open(CREDS_FILE, 'w') as f:
+            json.dump(creds, f, indent=4)
         
         await update.message.reply_text(
-            "✅ **Success!**\n"
-            "Credentials have been saved to the database.\n\n"
-            "👉 **IMPORTANT:** Please go to your Pella.app dashboard and **restart the 'scraper' service** to apply the new credentials."
+            "✅ **Success!** Credentials saved.\n\n"
+            "🔄 **Telling scraper to restart...**"
         )
-        print(f"[{datetime.datetime.now()}] Credentials updated in database.")
+        print(f"[{datetime.datetime.now()}] [Bot] Credentials updated successfully.")
+        
+        # --- 3. THIS IS THE RESTART LOGIC ---
+        if global_sio_client and global_sio_client.connected:
+            print("[Bot] Scraper is connected. Sending disconnect signal...")
+            global_sio_client.disconnect()
+            await update.message.reply_text("🚀 Scraper signaled to restart.")
+        else:
+            print("[Bot] Scraper was not connected. It will load new creds on its next try.")
+            await update.message.reply_text("Scraper was not running, but will use new credentials on its next start.")
+        # --- END RESTART LOGIC ---
         
     except Exception as e:
-        await update.message.reply_text(f"❌ **Error!**\nCould not save to database: {e}")
-        print(f"Error saving to DB: {e}")
+        await update.message.reply_text(f"❌ **Error!**\nCould not save credentials: {e}")
+        print(f"[Bot] Error saving credentials: {e}")
         
     context.user_data.clear()
     return ConversationHandler.END
@@ -492,28 +434,104 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-
 # ==========================================================
-# === MAIN EXECUTION
+# === MAIN EXECUTION LOGIC
 # ==========================================================
 
-def main_bot() -> None:
-    """Run the updater bot."""
-    print("Starting Updater Bot...")
-    
-    if not TELEGRAM_BOT_TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN environment variable not set.")
-        return
-    if not DATABASE_URL:
-        print("Error: DATABASE_URL environment variable not set.")
-        return
+def run_scraper_loop():
+    """
+    This function runs the scraper in a continuous loop.
+    If it disconnects (or is forced to by the bot),
+    it will loop, reload credentials, and reconnect.
+    """
+    global global_sio_client # <-- 4. UPDATE THE GLOBAL CLIENT
 
-    # Make sure the database table exists
-    setup_database()
+    while True:
+        MANUAL_TOKEN, MANUAL_USER, MANUAL_COOKIE_STRING = load_credentials()
+        
+        if not MANUAL_TOKEN:
+            print("[Scraper] Credentials not found. Waiting 30 seconds...")
+            time.sleep(30)
+            continue
 
+        print("[Scraper] Using manually provided credentials.")
+        
+        query_params_dict = {
+            "token": MANUAL_TOKEN,
+            "user": MANUAL_USER,
+            "EIO": 3, 
+        }
+        
+        full_socket_url = f"{SOCKET_URL}?{urlencode(query_params_dict)}"
+        
+        http_session = requests.Session()
+        http_session.cookies = parse_cookie_string_to_jar(MANUAL_COOKIE_STRING)
+        http_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+        })
+        
+        print("[Scraper] Session and tokens loaded.")
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        handler = CallHandler(http_session, executor)
+        
+        # --- 5. CREATE AND ASSIGN GLOBAL CLIENT ---
+        sio = socketio.Client(reconnection_attempts=10, reconnection_delay=5)
+        global_sio_client = sio 
+        
+        # --- Define Socket.IO event handlers ---
+        @sio.event
+        def connect():
+            print(f"\n[Scraper] Successfully connected!")
+
+        @sio.event
+        def connect_error(data):
+            print(f"[Scraper] Connection failed: {data}")
+            print("[Scraper] This may be due to an expired or invalid TOKEN, USER, or COOKIE.")
+
+        @sio.event
+        def disconnect():
+            print("[Scraper] Disconnected from WebSocket.")
+
+        sio.on('call', handler.on_call_event)
+
+        # --- Connect and Wait ---
+        try:
+            print(f"[Scraper] Connecting to {SOCKET_URL}...")
+            sio.connect(
+                full_socket_url,
+                transports=['websocket']
+            )
+            sio.wait() 
+            
+        except socketio.exceptions.ConnectionError as e:
+            print(f"[Scraper] Failed to connect: {e}")
+        except Exception as e:
+            print(f"[Scraper] An error occurred: {e}")
+        finally:
+            print("[Scraper] Cleaning up session...")
+            executor.shutdown(wait=False)
+            http_session.close()
+            global_sio_client = None # Clear the global client
+            print("[Scraper] Loop restarting in 5 seconds...")
+            time.sleep(5) # Wait before retrying
+
+
+if __name__ == '__main__':
+    print("Running auto-installer...")
+    install()
+    print("Installer finished.")
+
+    # --- 6. START THE SCRAPER IN A BACKGROUND THREAD ---
+    print("Starting scraper thread...")
+    scraper_thread = threading.Thread(target=run_scraper_loop, daemon=True)
+    scraper_thread.start()
+
+    # --- 7. START THE BOT IN THE MAIN THREAD ---
+    print("Starting Updater Bot in main thread...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    user_filter = filters.Chat(chat_id=TELEGRAM_CHAT_ID)
+    user_filter = filters.Chat(chat_id=TELEGRAM_CHAT_ID_INT) # Use integer ID
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('update', start_update, filters=user_filter)],
@@ -527,91 +545,5 @@ def main_bot() -> None:
 
     application.add_handler(conv_handler)
 
-    print(f"Bot is running. Send /update from chat ID {TELEGRAM_CHAT_ID} to begin.")
+    print(f"Bot is running. Send /update from chat ID {TELEGRAM_CHAT_ID_INT} to begin.")
     application.run_polling()
-
-def main_scraper():
-    """Run the scraper."""
-    print("Starting Scraper...")
-    
-    if not TELEGRAM_BOT_TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN environment variable not set. Scraper cannot send messages.")
-        # Note: Scraper might still run, but can't send.
-    if not DATABASE_URL:
-        print("Error: DATABASE_URL environment variable not set. Scraper cannot load credentials.")
-        return
-
-    # install() # Not needed on Pella, but doesn't hurt
-
-    MANUAL_TOKEN, MANUAL_USER, MANUAL_COOKIE_STRING = load_credentials()
-    if not MANUAL_TOKEN:
-        print("Failed to load credentials. Scraper will not start.")
-        return
-
-    print("Using manually provided credentials from DB.")
-    
-    query_params_dict = {
-        "token": MANUAL_TOKEN,
-        "user": MANUAL_USER,
-        "EIO": 3, 
-    }
-    
-    full_socket_url = f"{SOCKET_URL}?{urlencode(query_params_dict)}"
-    
-    http_session = requests.Session()
-    http_session.cookies = parse_cookie_string_to_jar(MANUAL_COOKIE_STRING)
-    http_session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-    })
-    
-    print("Session and tokens loaded.")
-
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-    handler = CallHandler(http_session, executor)
-    sio = socketio.Client(reconnection_attempts=10, reconnection_delay=5)
-
-    @sio.event
-    def connect():
-        print(f"\nSuccessfully connected!")
-
-    @sio.event
-    def connect_error(data):
-        print(f"Connection failed: {data}")
-        print("This may be due to expired credentials. Please send /update to the bot.")
-
-    @sio.event
-    def disconnect():
-        print("Disconnected from WebSocket.")
-
-    sio.on('call', handler.on_call_event)
-
-    try:
-        print(f"Connecting to {SOCKET_URL}...")
-        sio.connect(
-            full_socket_url,
-            transports=['websocket']
-        )
-        sio.wait() 
-        
-    except socketio.exceptions.ConnectionError as e:
-        print(f"Failed to connect: {e}")
-        print("This may be due to expired credentials. Please send /update to the bot.")
-    except KeyboardInterrupt:
-        print("Script interrupted.")
-    finally:
-        print("Shutting down...")
-        executor.shutdown(wait=True)
-        if sio.connected:
-            sio.disconnect()
-        http_session.close()
-        print("Scraper done.")
-
-if __name__ == '__main__':
-    if "--bot" in sys.argv:
-        main_bot()
-    elif "--scraper" in sys.argv:
-        main_scraper()
-    else:
-        print("Error: Please specify a mode.")
-        print("  Run with --bot to start the credential updater.")
-        print("  Run with --scraper to start the call scraper.")
