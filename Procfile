@@ -1,2 +1,1 @@
-bot: python manager_bot.py --bot
-scraper: python manager_bot.py --scraper
+web: gunicorn manager_bot:web
