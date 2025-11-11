@@ -21,7 +21,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, Conversati
 # ==========================================================
 # === UNIFIED CONFIGURATION
 # ==========================================================
-TELEGRAM_BOT_TOKEN = "7178045311:AAGCfm5V4lItW2Ir_n9F51_ammj5G7Hcs2g"
+TELEGRAM_BOT_TOKEN = "8068434240:AAF2xLDW3YJQ95wwYcI5Ir_m4x636EEIsck"
 TELEGRAM_CHAT_ID_INT = -1003175183012     # For the bot's filter (as an integer)
 TELEGRAM_CHAT_ID_STR = "-1003175183012"    # For sending messages (as a string)
 
