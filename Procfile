@@ -1,1 +1,1 @@
-web: gunicorn manager_bot:web
+web: gunicorn combined_bot_web:app
