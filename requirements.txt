@@ -1,0 +1,6 @@
+requests
+python-socketio[client]
+beautifulsoup4
+pycountry
+python-telegram-bot
+psycopg2-binary
