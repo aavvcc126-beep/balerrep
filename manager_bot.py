@@ -8,7 +8,7 @@ import concurrent.futures
 import socketio
 import json
 import pycountry
-import threading  # <-- 1. IMPORTED FOR PARALLEL EXECUTION
+import threading
 from bs4 import BeautifulSoup
 from http.cookiejar import CookieJar
 from requests.cookies import RequestsCookieJar
@@ -34,7 +34,6 @@ CREDS_FILE = 'creds.json'
 GET_TOKEN, GET_USER, GET_COOKIE = range(3)
 
 # --- Global variable to hold the scraper's socket client ---
-# This allows the bot to disconnect the scraper
 global_sio_client = None
 
 # ==========================================================
@@ -250,6 +249,22 @@ def download(url, cli, dur, country, cookie_jar):
     except Exception as e:
         print(f"[Scraper] Download failed: {e}")
 
+# --- THIS IS THE FIX ---
+def delayed_download(delay_seconds, url, cli, dur, country, cookie_jar):
+    """
+    Waits for a few seconds before calling the main download function
+    to allow the server to process the full audio file.
+    """
+    try:
+        print(f"[Scraper] Call ended. Waiting {delay_seconds}s for server processing...")
+        time.sleep(delay_seconds)
+        print(f"[Scraper] Waited {delay_seconds}s. Starting download for {cli}.")
+        # Now call the original download function
+        download(url, cli, dur, country, cookie_jar)
+    except Exception as e:
+        print(f"[Scraper] Error in delayed_download: {e}")
+# --- END FIX ---
+
 def parse_cookie_string_to_jar(cookie_string):
     cookie_jar = RequestsCookieJar()
     if not cookie_string:
@@ -336,14 +351,18 @@ class CallHandler:
                         
                         download_url = f"{BASE_URL}/live/calls/sound?did={did}&uuid={uuid}"
                         
+                        # --- THIS IS THE FIX ---
+                        # Call the delay function instead of downloading directly
                         self.executor.submit(
-                            download, 
+                            delayed_download,  # <-- Call the new delay function
+                            15,                # <-- Add a 15-second delay
                             download_url, 
                             did, 
                             last_duration,
                             country,
                             self.http_session.cookies
                         )
+                        # --- END FIX ---
                         
                         if uuid in self.detected_uuids:
                             self.detected_uuids.remove(uuid)
@@ -391,7 +410,7 @@ async def get_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def get_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Saves all credentials to file and tells scraper to restart."""
-    global global_sio_client # <-- 2. ACCESS THE GLOBAL SCRAPER CLIENT
+    global global_sio_client
     
     context.user_data['cookie'] = update.message.text.strip()
     
@@ -411,15 +430,13 @@ async def get_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         print(f"[{datetime.datetime.now()}] [Bot] Credentials updated successfully.")
         
-        # --- 3. THIS IS THE RESTART LOGIC ---
         if global_sio_client and global_sio_client.connected:
             print("[Bot] Scraper is connected. Sending disconnect signal...")
-            global_sio_client.disconnect()
+            await global_sio_client.disconnect() # Use await for async disconnect
             await update.message.reply_text("🚀 Scraper signaled to restart.")
         else:
             print("[Bot] Scraper was not connected. It will load new creds on its next try.")
             await update.message.reply_text("Scraper was not running, but will use new credentials on its next start.")
-        # --- END RESTART LOGIC ---
         
     except Exception as e:
         await update.message.reply_text(f"❌ **Error!**\nCould not save credentials: {e}")
@@ -435,16 +452,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 # ==========================================================
-# === MAIN EXECUTION LOGIC
+# === MAIN EXECUTION LOGIC (Using Asyncio and Threading)
 # ==========================================================
 
-def run_scraper_loop():
+async def run_scraper_async():
     """
     This function runs the scraper in a continuous loop.
-    If it disconnects (or is forced to by the bot),
-    it will loop, reload credentials, and reconnect.
+    It's designed to be run in its own thread.
     """
-    global global_sio_client # <-- 4. UPDATE THE GLOBAL CLIENT
+    global global_sio_client
+
+    # Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+    http_session = requests.Session()
+    handler = CallHandler(http_session, executor)
 
     while True:
         MANUAL_TOKEN, MANUAL_USER, MANUAL_COOKIE_STRING = load_credentials()
@@ -464,70 +488,62 @@ def run_scraper_loop():
         
         full_socket_url = f"{SOCKET_URL}?{urlencode(query_params_dict)}"
         
-        http_session = requests.Session()
         http_session.cookies = parse_cookie_string_to_jar(MANUAL_COOKIE_STRING)
         http_session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
         })
         
         print("[Scraper] Session and tokens loaded.")
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-        handler = CallHandler(http_session, executor)
         
-        # --- 5. CREATE AND ASSIGN GLOBAL CLIENT ---
-        sio = socketio.Client(reconnection_attempts=10, reconnection_delay=5)
+        sio = socketio.AsyncClient(reconnection_attempts=10, reconnection_delay=5)
         global_sio_client = sio 
         
-        # --- Define Socket.IO event handlers ---
         @sio.event
-        def connect():
+        async def connect():
             print(f"\n[Scraper] Successfully connected!")
 
         @sio.event
-        def connect_error(data):
+        async def connect_error(data):
             print(f"[Scraper] Connection failed: {data}")
             print("[Scraper] This may be due to an expired or invalid TOKEN, USER, or COOKIE.")
 
         @sio.event
-        def disconnect():
+        async def disconnect():
             print("[Scraper] Disconnected from WebSocket.")
 
         sio.on('call', handler.on_call_event)
 
-        # --- Connect and Wait ---
         try:
             print(f"[Scraper] Connecting to {SOCKET_URL}...")
-            sio.connect(
+            await sio.connect(
                 full_socket_url,
                 transports=['websocket']
             )
-            sio.wait() 
+            await sio.wait() 
             
         except socketio.exceptions.ConnectionError as e:
             print(f"[Scraper] Failed to connect: {e}")
         except Exception as e:
             print(f"[Scraper] An error occurred: {e}")
         finally:
-            print("[Scraper] Cleaning up session...")
-            executor.shutdown(wait=False)
-            http_session.close()
-            global_sio_client = None # Clear the global client
+            print("[Scraper] Cleaning up session for restart...")
+            global_sio_client = None 
             print("[Scraper] Loop restarting in 5 seconds...")
-            time.sleep(5) # Wait before retrying
-
+            await asyncio.sleep(5) # Use await for async sleep
 
 if __name__ == '__main__':
     print("Running auto-installer...")
     install()
     print("Installer finished.")
 
-    # --- 6. START THE SCRAPER IN A BACKGROUND THREAD ---
+    # --- START THE SCRAPER IN A BACKGROUND THREAD ---
     print("Starting scraper thread...")
-    scraper_thread = threading.Thread(target=run_scraper_loop, daemon=True)
+    # We must use asyncio.to_thread to run an async function in a new thread
+    # But run_scraper_async creates its own loop, so a simple Thread is better.
+    scraper_thread = threading.Thread(target=lambda: asyncio.run(run_scraper_async()), daemon=True)
     scraper_thread.start()
 
-    # --- 7. START THE BOT IN THE MAIN THREAD ---
+    # --- START THE BOT IN THE MAIN THREAD ---
     print("Starting Updater Bot in main thread...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
