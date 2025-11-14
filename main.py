@@ -7,31 +7,55 @@ import datetime
 import concurrent.futures
 import socketio
 import json
-import pycountry  # <-- 1. ADDED IMPORT
+import pycountry
+import threading  # <-- 1. IMPORTED FOR PARALLEL EXECUTION
 from bs4 import BeautifulSoup
 from http.cookiejar import CookieJar
 from requests.cookies import RequestsCookieJar
 from urllib.parse import urlencode
 
-# === CONFIG (No credentials here anymore) ===
+# --- Telegram Bot Imports ---
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, ContextTypes, filters
+
+# ==========================================================
+# === UNIFIED CONFIGURATION
+# ==========================================================
 TELEGRAM_BOT_TOKEN = "8068434240:AAF2xLDW3YJQ95wwYcI5Ir_m4x636EEIsck"
-TELEGRAM_CHAT_ID = "-1003175183012"
+TELEGRAM_CHAT_ID_INT = -1003175183012     # For the bot's filter (as an integer)
+TELEGRAM_CHAT_ID_STR = "-1003175183012"    # For sending messages (as a string)
+
+# --- FIXED CREDENTIALS ---
+# Token and User are now fixed, as requested
+FIXED_TOKEN = "eyJpdiI6IjVjVTR4RFJ2VWVaQVFiYmJ5RXpSdWc9PSIsInZhbHVlIjoiM0hmcjh1Um11cmdIWCtIbHE3S2oybmNaVHJ2cTM4c1RhZXFXbGxucGI4UWJMVGF2YUIya000QjROdEdIczl0d3JteUorZHBZVkpaaStNQkJNc2JGUzBcL1NxVEc5aGt4bHpyWG1HMFd6OHVFYUZReFZ0T2J1XC9SZW9CQmFpbnltSzFyOFJNeTgzM2tvbVRRTnZGS3FpK0ZcL1BaTVdabk9IaVJmZXJDVVhhMlwvdXQ3TTJxMGtMd0R6SCtndkpnaW9wa280NHh0QVF4OVo5TDlHSitcL0NNN0VmdldReFZmc2d4dFNmRjZqSis2VDlRPSIsIm1hYyI6IjM0MGU2ZmY4YmM3NDlkNmJmNDBjOWUwZDA0ODkyMTQyMTUyNmQxNzViNzljMGZkMjFjMzZmYmExYjliMmZiODEifQ=="
+FIXED_USER = "804e3d6b95a493d2c246ceacb3cff0a9"
+# -------------------------
+
 LIVE_URL = "https://www.orangecarrier.com/live/calls"
 SOCKET_URL = "wss://orangecarrier.com:8443"
 BASE_URL = "https://www.orangecarrier.com"
-CREDS_FILE = 'creds.json' # The file to read from
+CREDS_FILE = 'creds.json'
 
-# --- (REMOVED COUNTRY_FLAGS dictionary) ---
+# --- Conversation States for Bot (Only one state needed) ---
+GET_COOKIE = 0 # Only state 0 is needed
 
-# --- Auto-install libraries ---
+# --- Global variable to hold the scraper's socket client ---
+global_sio_client = None
+
+# ==========================================================
+# === AUTO-INSTALL LIBRARIES
+# ==========================================================
 def install():
-    libs = ["requests", "socketio", "bs4", "pycountry"] # <-- 2. ADDED PYCOUNTRY
+    """Installs required libraries."""
+    libs = ["requests", "socketio", "bs4", "pycountry", "python-telegram-bot"]
     for m in libs:
         try:
             if m == "bs4":
                 __import__("bs4")
-            elif m == "pycountry": # <-- 3. ADDED PYCOUNTRY CHECK
+            elif m == "pycountry":
                 __import__("pycountry")
+            elif m == "python-telegram-bot":
+                __import__("telegram")
             else:
                 __import__(m)
         except ImportError:
@@ -40,56 +64,53 @@ def install():
                 os.system(f"{sys.executable} -m pip install \"python-socketio[client]\"")
             elif m == "bs4":
                 os.system(f"{sys.executable} -m pip install beautifulsoup4")
-            elif m == "pycountry": # <-- 4. ADDED PYCOUNTRY INSTALL
+            elif m == "pycountry":
                 os.system(f"{sys.executable} -m pip install pycountry")
+            elif m == "python-telegram-bot":
+                 os.system(f"{sys.executable} -m pip install python-telegram-bot")
             else:
                 os.system(f"{sys.executable} -m pip install {m}")
-install()
-# --- End Install ---
 
-# === NEW HELPER: Get Flag Emoji ===
+# ==========================================================
+# === SCRAPER FUNCTIONS
+# ==========================================================
+
 def get_flag_emoji(country_name):
     """Generates a flag emoji from a country name."""
     try:
-        # Find the country by its name
         country = pycountry.countries.search_fuzzy(country_name)[0]
-        # Get its 2-letter ISO code (e.g., "US")
         code = country.alpha_2
-        # Convert the 2-letter code to flag emojis
-        # (e.g., "U" -> 🇺, "S" -> 🇸)
         return "".join(chr(0x1F1E6 + ord(char) - ord('A')) for char in code)
     except:
-        return "🌍" # Default to globe emoji if not found
+        return "🌍"
 
-# === NEW HELPER: Load Credentials ===
 def load_credentials():
-    """Loads credentials from the creds.json file."""
-    print("Loading credentials from creds.json...")
+    """Loads only the cookie from creds.json and combines with fixed token/user."""
+    print("[Scraper] Loading credentials from creds.json...")
     if not os.path.exists(CREDS_FILE):
-        print(f"Error: `{CREDS_FILE}` not found.")
-        print("Please run the `updater_bot.py` script and send it the /update command first.")
+        print(f"[Scraper] Error: `{CREDS_FILE}` not found.")
+        print("[Scraper] Please send the /update command to the bot to create it.")
         return None, None, None
         
     try:
         with open(CREDS_FILE, 'r') as f:
             creds = json.load(f)
         
-        token = creds.get('MANUAL_TOKEN')
-        user = creds.get('MANUAL_USER')
+        # Load the cookie from file
         cookie = creds.get('MANUAL_COOKIE_STRING')
         
-        if not token or not user or not cookie:
-            print("Error: `creds.json` is incomplete. Please run /update on the bot again.")
+        if not cookie:
+            print("[Scraper] Error: `creds.json` is missing cookie. Please run /update on the bot again.")
             return None, None, None
             
-        print("Credentials loaded successfully.")
-        return token, user, cookie
+        print("[Scraper] Credentials loaded successfully.")
+        # Return the FIXED token/user and the loaded cookie
+        return FIXED_TOKEN, FIXED_USER, cookie
         
     except Exception as e:
-        print(f"Error reading `{CREDS_FILE}`: {e}")
+        print(f"[Scraper] Error reading `{CREDS_FILE}`: {e}")
         return None, None, None
 
-# === NEW HELPER: Extract Country ===
 def get_country_name(termination_string):
     """Extracts the country name from a termination string."""
     try:
@@ -101,29 +122,27 @@ def get_country_name(termination_string):
             country_parts.append(part.upper())
         
         country = ' '.join(country_parts)
-        return country if country else "UNKNOWN" # Return UNKNOWN if empty
+        return country if country else "UNKNOWN"
     except:
         return "UNKNOWN"
 
-# === NEW HELPER: Mask Number ===
 def mask_number(num):
     """Masks a number like '8551****649'."""
     try:
         if len(num) > 7:
             return f"{num[:4]}****{num[-3:]}"
         else:
-            return f"{num[:1]}***{num[-1:]}" # Failsafe for short numbers
+            return f"{num[:1]}***{num[-1:]}"
     except:
         return num
 
-# === NEW HELPER: Send Text Message ===
 def send_telegram_message(text_message):
     """Sends a plain text message to Telegram."""
     try:
         payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
+            'chat_id': TELEGRAM_CHAT_ID_STR, # Use string version
             'text': text_message,
-            'parse_mode': 'HTML' # Use HTML for emojis
+            'parse_mode': 'HTML'
         }
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -131,88 +150,72 @@ def send_telegram_message(text_message):
             timeout=10
         )
         if not r.ok:
-            print(f"TG Message Failed: {r.text}")
+            print(f"[Scraper] TG Message Failed: {r.text}")
     except Exception as e:
-        print(f"TG Message Error: {e}")
+        print(f"[Scraper] TG Message Error: {e}")
 
-# === TELEGRAM AUDIO (with Thumbnail) ===
 def send_telegram_audio(file, num, country, duration_str):
     """Sends the audio file with the new caption format and thumbnail."""
-    audio_f = None  # Initialize file handles
-    thumb_f = None  #
+    audio_f = None
+    thumb_f = None
     try:
         masked = mask_number(num)
         local_time = datetime.datetime.now().strftime('%I:%M:%S %p')
-        flag = get_flag_emoji(country) # <-- 5. USE AUTO-FLAG
+        flag = get_flag_emoji(country)
         
-        # New caption format
         caption = f"""🔥 NEW CALL {country} {flag} RECEIVED ✨
 🌍 Country: {country} {flag}
 📞 Number: {masked}
 ⏰ Time: {local_time}
 """
         
-        # Get the bare filename (e.g., "rec_...mp3")
         file_title = os.path.basename(file) 
         
-        # Convert duration string to integer
         try:
             duration_int = int(duration_str)
         except:
-            duration_int = 0 # Default if conversion fails
+            duration_int = 0
         
-        # Create the data payload with 'title' and 'duration'
         data = {
-            "chat_id": TELEGRAM_CHAT_ID, 
+            "chat_id": TELEGRAM_CHAT_ID_STR, # Use string version
             "caption": caption,
-            "title": file_title,     # <--- Add unique title
-            "duration": duration_int # <--- Add duration
+            "title": file_title,
+            "duration": duration_int
         }
         
-        # --- Attach Audio and Thumbnail ---
         files_payload = {}
-        
-        # Open the audio file
         audio_f = open(file, "rb")
         files_payload["audio"] = audio_f
         
-        # Try to open and add the thumbnail
         try:
-            # This is the line that looks for your image
             thumb_f = open("thumbnail.png", "rb") 
             files_payload["thumbnail"] = thumb_f
-            print("Attaching thumbnail.png...")
+            print("[Scraper] Attaching thumbnail.png...")
         except FileNotFoundError:
-            # This is what is happening to you right now
-            print("thumbnail.png not found, sending audio without it.")
+            print("[Scraper] thumbnail.png not found, sending audio without it.")
         except Exception as e:
-            print(f"Error attaching thumbnail: {e}")
-        # --- End Thumbnail ---
+            print(f"[Scraper] Error attaching thumbnail: {e}")
 
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio",
             data=data,
-            files=files_payload, # <-- Use the new files payload
+            files=files_payload,
             timeout=30
         )
-        print("Telegram: Audio Sent" if r.ok else f"TG Audio Failed: {r.text}")
+        print("[Scraper] Telegram: Audio Sent" if r.ok else f"TG Audio Failed: {r.text}")
 
     except Exception as e:
-        print("TG Audio Error:", e)
+        print("[Scraper] TG Audio Error:", e)
     finally:
-        # --- CLEANUP ---
-        # Ensure all opened files are closed
         if audio_f:
             audio_f.close()
         if thumb_f:
             thumb_f.close()
-        # Delete the audio file after sending
         try: 
             os.remove(file)
         except: 
             pass
 
-# === DOWNLOAD ===
 def download(url, cli, dur, country, cookie_jar):
     try:
         s = requests.Session()
@@ -230,7 +233,7 @@ def download(url, cli, dur, country, cookie_jar):
         }
         s.headers.update(headers)
 
-        print(f"Downloading audio for {cli} from {url}")
+        print(f"[Scraper] Downloading audio for {cli} from {url}")
         
         with s.get(url, stream=True, timeout=30) as r:
             r.raise_for_status()
@@ -238,22 +241,20 @@ def download(url, cli, dur, country, cookie_jar):
             extension = ".mp3"
             if 'wav' in content_type: extension = ".wav"
             elif 'ogg' in content_type: extension = ".ogg"
-            elif 'aac' in content_type: extension = ".aac"
+            elif 'html' in content_type: extension = ".html"
 
             fn = f"rec_{cli}_{int(time.time())}{extension}"
-            print(f"Saving as: {fn} (Content-Type: {content_type})")
+            print(f"[Scraper] Saving as: {fn} (Content-Type: {content_type})")
             
             with open(fn, "wb") as f:
                 for c in r.iter_content(8192): 
                     f.write(c)
         
-        # Call the new audio sender function, passing duration
         send_telegram_audio(fn, cli, country, dur)
         
     except Exception as e:
-        print(f"Download failed: {e}")
+        print(f"[Scraper] Download failed: {e}")
 
-# === HELPER: Parse Cookie String ===
 def parse_cookie_string_to_jar(cookie_string):
     cookie_jar = RequestsCookieJar()
     if not cookie_string:
@@ -270,25 +271,20 @@ def parse_cookie_string_to_jar(cookie_string):
             )
     return cookie_jar
 
-# === HANDLE LIVE CALL DATA ===
 class CallHandler:
     def __init__(self, http_session, executor):
         self.http_session = http_session
         self.executor = executor
         self.detected_uuids = set()
-        self.active_calls = {} # <-- Stores info for active calls
+        self.active_calls = {}
 
     def on_call_event(self, data):
         try:
             calls_data = data.get('calls', {})
             page_list = calls_data.get('calls', [])
-            
-            # 'end' key contains a LIST, not a dictionary
             ended_calls_list = calls_data.get('end', []) 
-            
-            all_current_uuids_on_page = set() # For pruning
+            all_current_uuids_on_page = set()
 
-            # --- 1. Process ACTIVE calls (for detection and updates) ---
             for call_list_on_page in page_list: 
                 
                 if isinstance(call_list_on_page, dict):
@@ -297,7 +293,6 @@ class CallHandler:
                     call_iterable = call_list_on_page
 
                 for call in call_iterable:
-            
                     uuid = call.get('uuid')
                     if not uuid: continue
                     
@@ -309,51 +304,40 @@ class CallHandler:
                     except ValueError:
                         duration = 0
 
-                    # --- New Call Detection ---
                     if (status == 'up' and uuid not in self.detected_uuids):
                         self.detected_uuids.add(uuid)
-                        
                         did = call.get('cid_num', 'Unknown')
                         termination = call.get('termination', 'UNKNOWN')
                         country = get_country_name(termination)
                         
-                        # Store this call's info
                         self.active_calls[uuid] = {
                             'did': did,
                             'country': country,
                             'duration': duration
                         }
                         
-                        # Send "DETECTED" message
                         masked_num = mask_number(did)
-                        flag = get_flag_emoji(country) # <-- 6. USE AUTO-FLAG
-                        print(f"--- New Call Detected (at {duration}s) ---")
-                        print(f"  CLI/DID: {did} | UUID: {uuid}")
+                        flag = get_flag_emoji(country)
+                        print(f"[Scraper] --- New Call Detected (at {duration}s) ---")
+                        print(f"[Scraper]   CLI/DID: {did} | UUID: {uuid}")
                         text_message = f"🔥 NEW CALL {country} {flag} DETECTED ✨\n📞 Number: {masked_num}\n⏳ Waiting for Call 📞"
                         self.executor.submit(send_telegram_message, text_message)
                     
-                    # --- Update duration for existing calls ---
                     elif (status == 'up' and uuid in self.active_calls):
                         self.active_calls[uuid]['duration'] = duration
                         
-            # --- 2. Process ENDED calls (for download) ---
             if ended_calls_list:
-                for call_data in ended_calls_list: # <-- Loop over the LIST
+                for call_data in ended_calls_list:
                     uuid = call_data.get('uuid')
                     
-                    # Check if this is a call we were tracking
                     if uuid in self.active_calls:
-                        
-                        # Retrieve the call info and remove it from active tracking
                         call_info = self.active_calls.pop(uuid)
-                        
                         did = call_info['did']
                         country = call_info['country']
-                        # Use the final duration from the 'end' message if available
                         last_duration = str(call_data.get('duration', call_info['duration']))
 
-                        print(f"--- Call Ended. Submitting Download ---")
-                        print(f"  CLI/DID: {did} | UUID: {uuid} | Duration: {last_duration}")
+                        print(f"[Scraper] --- Call Ended. Submitting Download ---")
+                        print(f"[Scraper]   CLI/DID: {did} | UUID: {uuid} | Duration: {last_duration}")
                         
                         download_url = f"{BASE_URL}/live/calls/sound?did={did}&uuid={uuid}"
                         
@@ -361,98 +345,188 @@ class CallHandler:
                             download, 
                             download_url, 
                             did, 
-                            last_duration, # Send the final duration
+                            last_duration,
                             country,
                             self.http_session.cookies
                         )
                         
-                        # Also remove from detected set
                         if uuid in self.detected_uuids:
                             self.detected_uuids.remove(uuid)
 
-            # --- 3. Pruning ---
-            # Remove any calls from our tracking that vanished from the active list
             active_uuids_to_prune = set(self.active_calls.keys()) - all_current_uuids_on_page
             for uuid in active_uuids_to_prune:
-                print(f"Pruning stale call (no 'end' event): {uuid}")
+                print(f"[Scraper] Pruning stale call (no 'end' event): {uuid}")
                 self.active_calls.pop(uuid)
                 if uuid in self.detected_uuids:
                     self.detected_uuids.remove(uuid)
 
         except Exception as e:
-            print(f"Error in on_call_event: {e}")
-            print(f"Data: {str(data)[:200]}...")
+            print(f"[Scraper] Error in on_call_event: {e}")
+            print(f"[Scraper] Data: {str(data)[:200]}...")
 
-# === MAIN FUNCTION ===
-def main():
-    # --- Step 1: Load Manual Credentials ---
-    MANUAL_TOKEN, MANUAL_USER, MANUAL_COOKIE_STRING = load_credentials()
-    if not MANUAL_TOKEN:
-        # Error message was already printed by load_credentials()
-        return
+# ==========================================================
+# === BOT FUNCTIONS (MODIFIED)
+# ==========================================================
 
-    print("Using manually provided credentials.")
+async def start_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Starts the credential update conversation."""
+    await update.message.reply_text(
+        "OK. Please paste the entire new `cookie` string."
+    )
+    return GET_COOKIE # Go directly to getting the cookie
+
+# (REMOVED get_token and get_user functions)
+
+async def get_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Saves the cookie and tells scraper to restart."""
+    global global_sio_client
     
-    query_params_dict = {
-        "token": MANUAL_TOKEN,
-        "user": MANUAL_USER,
-        "EIO": 3, 
+    cookie_string = update.message.text.strip()
+    
+    creds = {
+        'MANUAL_TOKEN': FIXED_TOKEN,      # Save the hard-coded token
+        'MANUAL_USER': FIXED_USER,        # Save the hard-coded user
+        'MANUAL_COOKIE_STRING': cookie_string # Save the new cookie
     }
     
-    full_socket_url = f"{SOCKET_URL}?{urlencode(query_params_dict)}"
-    
-    http_session = requests.Session()
-    http_session.cookies = parse_cookie_string_to_jar(MANUAL_COOKIE_STRING)
-    http_session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-    })
-    
-    print("Session and tokens loaded.")
-
-    # --- Step 2: Setup Threading and Socket.IO ---
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-    handler = CallHandler(http_session, executor)
-    sio = socketio.Client(reconnection_attempts=10, reconnection_delay=5)
-
-    # --- Define Socket.IO event handlers ---
-    @sio.event
-    def connect():
-        print(f"\nSuccessfully connected!")
-
-    @sio.event
-    def connect_error(data):
-        print(f"Connection failed: {data}")
-        print("This may be due to an expired or invalid TOKEN, USER, or COOKIE.")
-        print("Please send /update to the updater_bot.py to provide new credentials.")
-
-    @sio.event
-    def disconnect():
-        print("Disconnected from WebSocket.")
-
-    # Main event listener
-    sio.on('call', handler.on_call_event)
-
-    # --- Step 3: Connect and Wait ---
     try:
-        print(f"Connecting to {SOCKET_URL}...")
-        sio.connect(
-            full_socket_url,
-            transports=['websocket']
-        )
-        sio.wait() 
+        with open(CREDS_FILE, 'w') as f:
+            json.dump(creds, f, indent=4)
         
-    except socketio.exceptions.ConnectionError as e:
-        print(f"Failed to connect: {e}")
-        print("This may be due to an expired or invalid TOKEN, USER, or COOKIE.")
-        print("Please send /update to the updater_bot.py to provide new credentials.")
-    except KeyboardInterrupt:
-        print("Script interrupted by user.")
-    finally:
-        print("Shutting down...")
-        executor.shutdown(wait=True)
-        sio.disconnect()
-        http_session.close()
-        print("Done.")
+        await update.message.reply_text(
+            "✅ **Success!** New cookie saved.\n\n"
+            "🔄 **Telling scraper to restart...**"
+        )
+        print(f"[{datetime.datetime.now()}] [Bot] Credentials updated successfully.")
+        
+        if global_sio_client and global_sio_client.connected:
+            print("[Bot] Scraper is connected. Sending disconnect signal...")
+            global_sio_client.disconnect()
+            await update.message.reply_text("🚀 Scraper signaled to restart.")
+        else:
+            print("[Bot] Scraper was not connected. It will load new creds on its next try.")
+            await update.message.reply_text("Scraper was not running, but will use new credentials on its next start.")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ **Error!**\nCould not save credentials: {e}")
+        print(f"[Bot] Error saving credentials: {e}")
+        
+    context.user_data.clear()
+    return ConversationHandler.END
 
-if __name__ == "__main__":
-    main()
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels the current update operation."""
+    await update.message.reply_text("Update cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ==========================================================
+# === MAIN EXECUTION LOGIC
+# ==========================================================
+
+def run_scraper_loop():
+    """
+    This function runs the scraper in a continuous loop.
+    If it disconnects (or is forced to by the bot),
+    it will loop, reload credentials, and reconnect.
+    """
+    global global_sio_client
+
+    while True:
+        MANUAL_TOKEN, MANUAL_USER, MANUAL_COOKIE_STRING = load_credentials()
+        
+        if not MANUAL_TOKEN:
+            print("[Scraper] Credentials not found. Waiting 30 seconds...")
+            time.sleep(30)
+            continue
+
+        print("[Scraper] Using provided credentials.")
+        
+        query_params_dict = {
+            "token": MANUAL_TOKEN,
+            "user": MANUAL_USER,
+            "EIO": 3, 
+        }
+        
+        full_socket_url = f"{SOCKET_URL}?{urlencode(query_params_dict)}"
+        
+        http_session = requests.Session()
+        http_session.cookies = parse_cookie_string_to_jar(MANUAL_COOKIE_STRING)
+        http_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+        })
+        
+        print("[Scraper] Session and tokens loaded.")
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        handler = CallHandler(http_session, executor)
+        
+        sio = socketio.Client(reconnection_attempts=10, reconnection_delay=5)
+        global_sio_client = sio 
+        
+        @sio.event
+        def connect():
+            print(f"\n[Scraper] Successfully connected!")
+
+        @sio.event
+        def connect_error(data):
+            print(f"[Scraper] Connection failed: {data}")
+            print("[Scraper] This may be due to an expired or invalid TOKEN, USER, or COOKIE.")
+
+        @sio.event
+        def disconnect():
+            print("[Scraper] Disconnected from WebSocket.")
+
+        sio.on('call', handler.on_call_event)
+
+        # --- Connect and Wait ---
+        try:
+            print(f"[Scraper] Connecting to {SOCKET_URL}...")
+            sio.connect(
+                full_socket_url,
+                transports=['websocket']
+            )
+            sio.wait() 
+            
+        except socketio.exceptions.ConnectionError as e:
+            print(f"[Scraper] Failed to connect: {e}")
+        except Exception as e:
+            print(f"[Scraper] An error occurred: {e}")
+        finally:
+            print("[Scraper] Cleaning up session...")
+            executor.shutdown(wait=False)
+            http_session.close()
+            global_sio_client = None # Clear the global client
+            print("[Scraper] Loop restarting in 5 seconds...")
+            time.sleep(5) # Wait before retrying
+
+
+if __name__ == '__main__':
+    print("Running auto-installer...")
+    install()
+    print("Installer finished.")
+
+    # --- 6. START THE SCRAPER IN A BACKGROUND THREAD ---
+    print("Starting scraper thread...")
+    scraper_thread = threading.Thread(target=run_scraper_loop, daemon=True)
+    scraper_thread.start()
+
+    # --- 7. START THE BOT IN THE MAIN THREAD ---
+    print("Starting Updater Bot in main thread...")
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    user_filter = filters.Chat(chat_id=TELEGRAM_CHAT_ID_INT) # Use integer ID
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('update', start_update, filters=user_filter)],
+        states={
+            # Only one state: get the cookie
+            GET_COOKIE: [MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, get_cookie)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel, filters=user_filter)],
+    )
+
+    application.add_handler(conv_handler)
+
+    print(f"Bot is running. Send /update from chat ID {TELEGRAM_CHAT_ID_INT} to begin.")
+    application.run_polling()
